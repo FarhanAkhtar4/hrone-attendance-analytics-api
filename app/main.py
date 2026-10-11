@@ -4,36 +4,35 @@ HROne Employee Attendance & Analytics API
 FastAPI + MongoDB 7.0 production implementation.
 
 Endpoints:
-  GET  /health                                   – MongoDB ping + lazy index
-  POST /employees                                 – Create employee (201)
-  GET  /employees                                 – List employees (paginated)
-  POST /attendance/punch-in                       – Record punch-in (201)
-  POST /attendance/punch-out                      – Record punch-out
-  GET  /attendance                                – List attendance (paginated, filtered)
-  PATCH /attendance/{emp_code}/{date}             – Regularize attendance
-  GET  /analytics/employees/{emp_code}/monthly    – Monthly employee analytics
-  GET  /analytics/departments/summary             – Department summary
-  GET  /analytics/leaderboard/late                – Late-arrival leaderboard
-  GET  /analytics/departments/{department}/trend  – Department trend (7-day MA)
-  GET  /admin/explain/{endpoint}                  – Query explain plan
+  GET  /health                                   - MongoDB ping + lazy index
+  POST /employees                                 - Create employee (201)
+  GET  /employees                                 - List employees (paginated)
+  POST /attendance/punch-in                       - Record punch-in (201)
+  POST /attendance/punch-out                      - Record punch-out
+  GET  /attendance                                - List attendance (paginated, filtered)
+  PATCH /attendance/{emp_code}/{date}             - Regularize attendance
+  GET  /analytics/employees/{emp_code}/monthly    - Monthly employee analytics
+  GET  /analytics/departments/summary             - Department summary
+  GET  /analytics/leaderboard/late                - Late-arrival leaderboard
+  GET  /analytics/departments/{department}/trend  - Department trend (7-day MA)
+  GET  /admin/explain/{endpoint}                  - Query explain plan
 """
 
-import os
-import re
 import json
-import math
+import os
 import threading
-from datetime import datetime, timezone, timedelta, date as date_type
+from datetime import UTC, datetime, timedelta, timezone
+from datetime import date as date_type
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Optional, Any
+from typing import Any
 
+from bson import json_util
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator, model_validator, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
-from bson import json_util
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Environment & Constants
@@ -45,7 +44,7 @@ MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB: str = os.getenv("MONGO_DB", "attendance_db")
 
 IST = timezone(timedelta(hours=5, minutes=30))
-UTC = timezone.utc
+UTC = UTC
 
 EPOCH_MS_MIN: int = 100_000_000_000
 EPOCH_MS_MAX: int = 4_102_444_800_000
@@ -759,7 +758,7 @@ class PunchInRequest(BaseModel):
     model_config = {"strict": True}
 
     emp_code: str
-    punched_at: Optional[int] = None
+    punched_at: int | None = None
     status: str = "PRESENT"
 
     @field_validator("punched_at")
@@ -787,7 +786,7 @@ class PunchOutRequest(BaseModel):
     model_config = {"strict": True}
 
     emp_code: str
-    punched_at: Optional[int] = None
+    punched_at: int | None = None
 
     @field_validator("punched_at")
     @classmethod
@@ -807,9 +806,9 @@ class RegularizeRequest(BaseModel):
     """
     model_config = {"strict": True}
 
-    status: Optional[str] = None
-    punch_in: Optional[int] = None
-    punch_out: Optional[int] = None
+    status: str | None = None
+    punch_in: int | None = None
+    punch_out: int | None = None
     regularized_by: str = Field(..., min_length=1, max_length=50)
     reason: str = Field(..., min_length=1, max_length=200)
 
@@ -892,7 +891,7 @@ async def create_employee(body: EmployeeCreate):
 # ---------------------------------------------------------------------------
 @app.get("/employees")
 async def list_employees(
-    department: Optional[str] = Query(None, description="Filter by department"),
+    department: str | None = Query(None, description="Filter by department"),
     page: int = Query(1, ge=1, description="Page number (1-based)"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
 ):
@@ -1118,10 +1117,10 @@ async def punch_out(body: PunchOutRequest):
 # ---------------------------------------------------------------------------
 @app.get("/attendance")
 async def list_attendance(
-    emp_code: Optional[str] = Query(None, description="Filter by employee code"),
-    date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
-    status: Optional[str] = Query(None, description="Filter by status"),
-    department: Optional[str] = Query(None, description="Filter by department"),
+    emp_code: str | None = Query(None, description="Filter by employee code"),
+    date: str | None = Query(None, description="Filter by date (YYYY-MM-DD)"),
+    status: str | None = Query(None, description="Filter by status"),
+    department: str | None = Query(None, description="Filter by department"),
     page: int = Query(1, ge=1, description="Page number (1-based)"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
 ):
@@ -2196,7 +2195,7 @@ async def explain_query(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to explain query: {str(e)}",
+            detail=f"Failed to explain query: {e!s}",
         )
 
     return {
