@@ -5,12 +5,12 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 ignore = [
-    "BLE001",
-    "S110",
-    "EXE002",
-    "B904",
-    "SIM108",
-    "E712",
-    "E402",
-    "E501",
+    "BLE001",   # blind except: needed for mongo health retry
+    "S110",     # try-except-pass: intentional startup retry
+    "EXE002",   # no shebang: not scripts
+    "B904",     # raise from: HTTPException doesn't need chaining
+    "SIM108",   # ternary: if/else reads better for month boundary
+    "E712",     # == True/False: reads better in some test asserts
+    "E402",     # import not top: test needs sys.path before app import
+    "E501",     # line too long: agg pipelines are inherently long
 ]

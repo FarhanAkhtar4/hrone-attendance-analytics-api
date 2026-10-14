@@ -1,22 +1,4 @@
-"""
-HROne Employee Attendance & Analytics API
-=========================================
-FastAPI + MongoDB 7.0 production implementation.
-
-Endpoints:
-  GET  /health                                   - MongoDB ping + lazy index
-  POST /employees                                 - Create employee (201)
-  GET  /employees                                 - List employees (paginated)
-  POST /attendance/punch-in                       - Record punch-in (201)
-  POST /attendance/punch-out                      - Record punch-out
-  GET  /attendance                                - List attendance (paginated, filtered)
-  PATCH /attendance/{emp_code}/{date}             - Regularize attendance
-  GET  /analytics/employees/{emp_code}/monthly    - Monthly employee analytics
-  GET  /analytics/departments/summary             - Department summary
-  GET  /analytics/leaderboard/late                - Late-arrival leaderboard
-  GET  /analytics/departments/{department}/trend  - Department trend (7-day MA)
-  GET  /admin/explain/{endpoint}                  - Query explain plan
-"""
+"""HROne Attendance & Analytics API -- FastAPI + MongoDB 7.0."""
 
 import json
 import os
@@ -34,9 +16,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Environment & Constants
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 load_dotenv(override=False)
 
@@ -44,7 +26,7 @@ MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB: str = os.getenv("MONGO_DB", "attendance_db")
 
 IST = timezone(timedelta(hours=5, minutes=30))
-UTC = UTC
+UTC = UTC  # shadows the stdlib import, clearer than timezone.utc everywhere
 
 EPOCH_MS_MIN: int = 100_000_000_000
 EPOCH_MS_MAX: int = 4_102_444_800_000
@@ -55,9 +37,9 @@ HALF_DAY_THRESHOLD_HOURS: float = 4.50 # Work hours below this = half day
 MAX_PUNCH_SPREAD_HOURS: float = 24.0   # punch_out must be within 24h of punch_in
 TREND_MAX_DAYS: int = 92               # Maximum date range for trend endpoint
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # MongoDB Client & Collections
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 client = MongoClient(
     MONGO_URI,
@@ -72,9 +54,9 @@ db = client[MONGO_DB]
 employees_col = db["employees"]
 attendance_col = db["attendance_logs"]
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Index Definitions
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 EMPLOYEE_INDEXES: list[dict[str, Any]] = [
     {"keys": [("emp_code", 1)], "unique": True},
@@ -96,7 +78,7 @@ _index_lock = threading.Lock()
 
 
 def _create_indexes() -> None:
-    """Create all required indexes on employees and attendance_logs collections."""
+    """Create indexes on both collections."""
     for idx in EMPLOYEE_INDEXES:
         employees_col.create_index(idx["keys"], unique=idx.get("unique", False))
     for idx in ATTENDANCE_INDEXES:
@@ -104,7 +86,7 @@ def _create_indexes() -> None:
 
 
 def _ensure_indexes() -> None:
-    """Lazily create indexes if not already done (called on first /health success)."""
+    """Create indexes on first successful /health (double-checked locking)."""
     global _indexes_created
     if _indexes_created:
         return
@@ -119,17 +101,16 @@ def _ensure_indexes() -> None:
             pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # FastAPI Application & Lifespan
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 from contextlib import asynccontextmanager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Attempt to create indexes at startup; if MongoDB is not ready,
-    indexes will be created lazily on the first successful /health check."""
+    """Try creating indexes at startup; falls back to lazy creation on /health."""
     try:
         _create_indexes()
         global _indexes_created
@@ -145,74 +126,37 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Helper Functions
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 
 def to_utc_dt(ms: int) -> datetime:
-    """Convert epoch milliseconds to a UTC-aware datetime, truncated to whole seconds.
-
-    Args:
-        ms: Epoch time in milliseconds.
-
-    Returns:
-        datetime: UTC-aware datetime with microseconds = 0.
-    """
+    """epoch ms -> UTC datetime, truncated to whole seconds."""
     secs = ms // 1000
     return datetime.fromtimestamp(secs, tz=UTC)
 
 
 def to_ms(dt: datetime) -> int:
-    """Convert a UTC-aware datetime to epoch milliseconds (truncated to seconds).
-
-    Args:
-        dt: A timezone-aware datetime (expected UTC).
-
-    Returns:
-        int: Epoch time in milliseconds.
-    """
+    """UTC datetime -> epoch ms (truncated to seconds)."""
     return int(dt.timestamp()) * 1000
 
 
 def truncate_to_seconds(dt: datetime) -> datetime:
-    """Truncate a datetime to whole seconds by zeroing microseconds.
-
-    Args:
-        dt: A datetime object.
-
-    Returns:
-        datetime: The same datetime with microsecond=0.
-    """
+    """Zero out microseconds."""
     return dt.replace(microsecond=0)
 
 
 def to_ist(dt_utc: datetime) -> datetime:
-    """Convert a UTC datetime to IST (UTC+5:30).
-
-    Args:
-        dt_utc: A UTC-aware datetime.
-
-    Returns:
-        datetime: The same instant in IST.
-    """
+    """UTC -> IST (UTC+5:30)."""
     return dt_utc.astimezone(IST)
 
 
 def get_ist_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
-    """Derive the attendance date in IST for a given punch-in time.
+    """Get the attendance date in IST for a punch-in.
 
-    Per R1: For overnight shifts (shift_end <= shift_start), if the punch-in
-    IST time is before the shift end time, the attendance date is the
-    *previous* IST calendar day.
-
-    Args:
-        punch_in_utc: The punch-in time in UTC.
-        shift_start: Shift start time as "HH:MM".
-        shift_end: Shift end time as "HH:MM".
-
-    Returns:
-        str: Attendance date in "YYYY-MM-DD" format.
+    For overnight shifts (end <= start), if punch-in IST is before shift end
+    (early morning), we attribute it to the previous calendar day.
     """
     punch_ist = to_ist(punch_in_utc)
     shift_start_h, shift_start_m = parse_shift_time(shift_start)
@@ -234,14 +178,7 @@ def get_ist_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> st
 
 
 def parse_shift_time(shift_str: str) -> tuple[int, int]:
-    """Parse a shift time string in "HH:MM" format.
-
-    Args:
-        shift_str: Time string like "09:00" or "18:30".
-
-    Returns:
-        tuple[int, int]: (hours, minutes) as integers.
-    """
+    """'09:30' -> (9, 30)."""
     parts = shift_str.split(":")
     return int(parts[0]), int(parts[1])
 
@@ -251,24 +188,10 @@ def compute_late_minutes(
     shift_start: str,
     date_str: str | None = None,
 ) -> int:
-    """Compute the number of minutes an employee was late.
+    """Minutes late after grace period (F1).
 
-    F1 fix: If date_str is provided, anchor the shift start to the
-    attendance date (not the punch-in's calendar day). This correctly
-    handles overnight shifts where the punch-in date in IST may differ
-    from the attendance date.
-
-    Grace period: 10 minutes (GRACE_PERIOD_SECONDS = 600).
-    An employee is only considered late if they arrive more than 10
-    minutes after the shift start.
-
-    Args:
-        punch_in_utc: The actual punch-in time in UTC.
-        shift_start: Shift start time as "HH:MM".
-        date_str: The attendance date in "YYYY-MM-DD" format (optional).
-
-    Returns:
-        int: Number of minutes late (0 if within grace period).
+    If date_str is given, anchor the shift start to the attendance date
+    instead of the punch-in's calendar day (fixes overnight shift bug).
     """
     shift_h, shift_m = parse_shift_time(shift_start)
 
@@ -316,22 +239,9 @@ def compute_overtime_minutes(
     date_str: str,
     shift_start: str,
 ) -> int:
-    """Compute the number of overtime minutes.
+    """Overtime minutes past the 30-min threshold (R3).
 
-    R3: For overnight shifts (shift_end <= shift_start), the shift end
-    is on the next calendar day relative to the attendance date.
-
-    Overtime threshold: Must be >= 30 minutes (OVERTIME_THRESHOLD_MINUTES)
-    to be counted. Anything below the threshold is rounded down to 0.
-
-    Args:
-        punch_out_utc: The actual punch-out time in UTC.
-        shift_end: Shift end time as "HH:MM".
-        date_str: The attendance date in "YYYY-MM-DD" format.
-        shift_start: Shift start time as "HH:MM" (for overnight detection).
-
-    Returns:
-        int: Number of overtime minutes (0 if below threshold).
+    For overnight shifts (end <= start), shift end is on the next day.
     """
     shift_end_h, shift_end_m = parse_shift_time(shift_end)
     shift_start_h, shift_start_m = parse_shift_time(shift_start)
@@ -368,102 +278,36 @@ def compute_overtime_minutes(
 
 
 def compute_work_hours(punch_in_utc: datetime, punch_out_utc: datetime) -> float:
-    """Compute the total work hours between punch-in and punch-out.
-
-    R4: Uses Decimal.quantize with ROUND_HALF_UP to ensure correct
-    rounding to 2 decimal places (never uses Python's built-in round()
-    or MongoDB's $round).
-
-    Args:
-        punch_in_utc: Punch-in time in UTC.
-        punch_out_utc: Punch-out time in UTC.
-
-    Returns:
-        float: Work hours rounded to 2 decimal places (half-up).
-    """
+    """Work hours with half-up rounding via Decimal (R4)."""
     diff_seconds = (punch_out_utc - punch_in_utc).total_seconds()
     hours = diff_seconds / 3600.0
     return float(Decimal(str(hours)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def compute_half_day(work_hours: float | None) -> bool:
-    """Determine if the work day qualifies as a half day.
-
-    R5: A half day is when work_hours < 4.50 (HALF_DAY_THRESHOLD_HOURS).
-
-    Args:
-        work_hours: The computed work hours (or None if not punched out).
-
-    Returns:
-        bool: True if work_hours < 4.50. None → False.
-    """
+    """True if work_hours < 4.50 (R5). None -> False."""
     if work_hours is None:
         return False
     return work_hours < HALF_DAY_THRESHOLD_HOURS
 
 
 def round_half_up_2(value: Any) -> float:
-    """Round a numeric value to 2 decimal places using ROUND_HALF_UP.
-
-    Uses Decimal for exact rounding, avoiding Python's built-in round()
-    which uses banker's rounding (ROUND_HALF_EVEN).
-
-    Args:
-        value: Any numeric type convertible to Decimal.
-
-    Returns:
-        float: The rounded value as a float with 2 decimal places.
-    """
+    """Round to 2dp with Decimal ROUND_HALF_UP (not banker's round)."""
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def round_half_up_4(value: Any) -> float:
-    """Round a numeric value to 4 decimal places using ROUND_HALF_UP.
-
-    Args:
-        value: Any numeric type convertible to Decimal.
-
-    Returns:
-        float: The rounded value as a float with 4 decimal places.
-    """
+    """Round to 4dp with Decimal ROUND_HALF_UP."""
     return float(Decimal(str(value)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
 
 
 def is_present_status(status: str) -> bool:
-    """Check if a given attendance status counts as 'present'.
-
-    The following statuses are considered present:
-    - PRESENT: Employee physically present at workplace
-    - WFH: Work from home
-    - ON_DUTY: Employee on official duty/field work
-
-    Args:
-        status: The attendance status string.
-
-    Returns:
-        bool: True if the status is a present-type status.
-    """
+    """True if status is PRESENT, WFH, or ON_DUTY."""
     return status in ("PRESENT", "WFH", "ON_DUTY")
 
 
 def validate_epoch_ms(v: Any) -> int:
-    """Validate and return an epoch millisecond value.
-
-    Rejects:
-    - Boolean values (TypeError) — bool is a subclass of int in Python
-    - Non-integer values (TypeError)
-    - Values outside [EPOCH_MS_MIN, EPOCH_MS_MAX] (ValueError)
-
-    Args:
-        v: The value to validate.
-
-    Returns:
-        int: The validated epoch millisecond value.
-
-    Raises:
-        TypeError: If v is a bool or not an integer.
-        ValueError: If v is outside the valid epoch range.
-    """
+    """Validate epoch ms -- rejects bool/non-int and out-of-range values."""
     if isinstance(v, bool):
         raise TypeError("Epoch milliseconds must be an integer, not bool")
     if not isinstance(v, int):
@@ -476,20 +320,7 @@ def validate_epoch_ms(v: Any) -> int:
 
 
 def working_days_in_month(year: int, month: int, joined_on: str) -> int:
-    """Count the number of working days (Mon-Fri) in a month, considering
-    the employee's join date.
-
-    R7: Count Mon-Fri from max(month_start, joined_on) to month_end.
-    If the employee joined after the month ends, returns 0.
-
-    Args:
-        year: The year (e.g., 2024).
-        month: The month (1-12).
-        joined_on: Employee's join date in "YYYY-MM-DD" format.
-
-    Returns:
-        int: Number of working days in the month.
-    """
+    """Mon-Fri working days in a month, capped by the employee's join date (R7)."""
     month_start = date_type(year, month, 1)
 
     if month == 12:
@@ -518,32 +349,13 @@ def working_days_in_month(year: int, month: int, joined_on: str) -> int:
 
 
 def _sanitize_doc(doc: dict) -> dict:
-    """Remove MongoDB internal fields (_id) from a document dict.
-
-    Args:
-        doc: A MongoDB document dictionary.
-
-    Returns:
-        dict: A copy of the document without _id or id fields.
-    """
+    """Strip _id and id from a MongoDB doc."""
     result = {k: v for k, v in doc.items() if k not in ("_id", "id")}
     return result
 
 
 def serialize_attendance_record(doc: dict) -> dict:
-    """Convert a MongoDB attendance document to the API response format.
-
-    - Converts punch_in/punch_out from UTC datetimes to epoch milliseconds
-    - Removes _id/id fields
-    - Converts created_at/updated_at to epoch milliseconds
-    - Serializes the history array
-
-    Args:
-        doc: A MongoDB attendance_logs document.
-
-    Returns:
-        dict: API-formatted attendance record.
-    """
+    """Convert datetimes to epoch ms and strip _id."""
     result = {
         "emp_code": doc.get("emp_code"),
         "date": doc.get("date"),
@@ -564,16 +376,7 @@ def serialize_attendance_record(doc: dict) -> dict:
 
 
 def serialize_history(history: list) -> list:
-    """Convert a list of history entries to API format.
-
-    Converts the timestamp field from UTC datetime to epoch milliseconds.
-
-    Args:
-        history: A list of history entry dicts from MongoDB.
-
-    Returns:
-        list: A list of API-formatted history entries.
-    """
+    """Convert history entry timestamps to epoch ms."""
     result = []
     for entry in history:
         h = dict(entry)
@@ -586,17 +389,7 @@ def serialize_history(history: list) -> list:
 
 
 def serialize_employee(doc: dict) -> dict:
-    """Convert a MongoDB employee document to the API response format.
-
-    - Converts created_at from UTC datetime to epoch milliseconds
-    - Removes _id/id fields
-
-    Args:
-        doc: A MongoDB employees document.
-
-    Returns:
-        dict: API-formatted employee record.
-    """
+    """Convert employee doc to API response (epoch ms, no _id)."""
     result = {
         "emp_code": doc.get("emp_code"),
         "name": doc.get("name"),
@@ -611,17 +404,7 @@ def serialize_employee(doc: dict) -> dict:
 
 
 def _validate_month_str(month: str) -> tuple[int, int]:
-    """Validate and parse a month string in YYYY-MM format.
-
-    Args:
-        month: Month string to validate.
-
-    Returns:
-        tuple[int, int]: (year, month_number)
-
-    Raises:
-        HTTPException: 422 if format is invalid.
-    """
+    """Parse 'YYYY-MM' and return (year, month). Raises 422 on bad format."""
     try:
         parts = month.split("-")
         year = int(parts[0])
@@ -634,15 +417,7 @@ def _validate_month_str(month: str) -> tuple[int, int]:
 
 
 def _month_end_str(year: int, mon: int) -> str:
-    """Get the last day of a month as a YYYY-MM-DD string.
-
-    Args:
-        year: The year.
-        mon: The month (1-12).
-
-    Returns:
-        str: The last day of the month in "YYYY-MM-DD" format.
-    """
+    """Last day of the month as 'YYYY-MM-DD'."""
     if mon == 12:
         return f"{year}-12-31"
     next_month = date_type(year, mon + 1, 1)
@@ -651,31 +426,12 @@ def _month_end_str(year: int, mon: int) -> str:
 
 
 def _month_start_str(year: int, mon: int) -> str:
-    """Get the first day of a month as a YYYY-MM-DD string.
-
-    Args:
-        year: The year.
-        mon: The month (1-12).
-
-    Returns:
-        str: The first day of the month in "YYYY-MM-DD" format.
-    """
+    """First day of the month as 'YYYY-MM-DD'."""
     return f"{year}-{mon:02d}-01"
 
 
 def _validate_date_str(date_str: str, field_name: str = "date") -> date_type:
-    """Validate and parse a date string in YYYY-MM-DD format.
-
-    Args:
-        date_str: Date string to validate.
-        field_name: Name of the field for error messages.
-
-    Returns:
-        date_type: The parsed date object.
-
-    Raises:
-        HTTPException: 422 if format is invalid.
-    """
+    """Parse 'YYYY-MM-DD' into a date object. Raises 422 on bad format."""
     try:
         parts = date_str.split("-")
         return date_type(int(parts[0]), int(parts[1]), int(parts[2]))
@@ -686,22 +442,12 @@ def _validate_date_str(date_str: str, field_name: str = "date") -> date_type:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Pydantic Models
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 class EmployeeCreate(BaseModel):
-    """Schema for creating a new employee.
-
-    Fields:
-        emp_code: Employee code matching pattern ^EMP\\d{4,6}$
-        name: Employee name (1-100 characters)
-        email: Valid email address
-        department: Department name (1-50 characters)
-        shift_start: Shift start time in HH:MM (24-hour format)
-        shift_end: Shift end time in HH:MM (24-hour format)
-        joined_on: Join date in YYYY-MM-DD format
-    """
+    """Employee creation schema (emp_code pattern, email, shifts, join date)."""
     emp_code: str = Field(
         ...,
         pattern=r"^EMP\d{4,6}$",
@@ -732,7 +478,7 @@ class EmployeeCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_shifts_not_equal(self):
-        """Ensure shift_start and shift_end are not the same."""
+        """shift_start != shift_end."""
         if self.shift_start == self.shift_end:
             raise ValueError("shift_start must not equal shift_end")
         return self
@@ -740,7 +486,7 @@ class EmployeeCreate(BaseModel):
     @field_validator("joined_on")
     @classmethod
     def validate_joined_on_date(cls, v: str) -> str:
-        """Validate that joined_on is a valid calendar date."""
+        """Check joined_on is a real calendar date."""
         try:
             parts = v.split("-")
             date_type(int(parts[0]), int(parts[1]), int(parts[2]))
@@ -750,11 +496,7 @@ class EmployeeCreate(BaseModel):
 
 
 class PunchInRequest(BaseModel):
-    """Schema for punch-in request.
-
-    F2: model_config = {"strict": True} ensures no extra fields and
-    strict type checking (no implicit coercion).
-    """
+    """Punch-in: strict model, punched_at defaults to now, status defaults to PRESENT."""
     model_config = {"strict": True}
 
     emp_code: str
@@ -764,7 +506,7 @@ class PunchInRequest(BaseModel):
     @field_validator("punched_at")
     @classmethod
     def validate_punched_at(cls, v):
-        """Validate punched_at epoch milliseconds if provided."""
+        """Validate punched_at if provided."""
         if v is not None:
             return validate_epoch_ms(v)
         return v
@@ -772,17 +514,14 @@ class PunchInRequest(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
-        """Restrict status to present-type values."""
+        """Status must be PRESENT, WFH, or ON_DUTY."""
         if v not in ("PRESENT", "WFH", "ON_DUTY"):
             raise ValueError("Status must be one of: PRESENT, WFH, ON_DUTY")
         return v
 
 
 class PunchOutRequest(BaseModel):
-    """Schema for punch-out request.
-
-    F2: model_config = {"strict": True} for strict validation.
-    """
+    """Punch-out: strict model, punched_at defaults to now."""
     model_config = {"strict": True}
 
     emp_code: str
@@ -791,19 +530,14 @@ class PunchOutRequest(BaseModel):
     @field_validator("punched_at")
     @classmethod
     def validate_punched_at(cls, v):
-        """Validate punched_at epoch milliseconds if provided."""
+        """Validate punched_at if provided."""
         if v is not None:
             return validate_epoch_ms(v)
         return v
 
 
 class RegularizeRequest(BaseModel):
-    """Schema for attendance regularization request.
-
-    F2: model_config = {"strict": True} for strict validation.
-    At least one of status/punch_in/punch_out should be provided
-    along with regularized_by and reason.
-    """
+    """Regularize: strict model, needs regularized_by + reason."""
     model_config = {"strict": True}
 
     status: str | None = None
@@ -815,7 +549,7 @@ class RegularizeRequest(BaseModel):
     @field_validator("punch_in")
     @classmethod
     def validate_punch_in(cls, v):
-        """Validate punch_in epoch milliseconds if provided."""
+        """Validate punch_in if provided."""
         if v is not None:
             return validate_epoch_ms(v)
         return v
@@ -823,27 +557,22 @@ class RegularizeRequest(BaseModel):
     @field_validator("punch_out")
     @classmethod
     def validate_punch_out(cls, v):
-        """Validate punch_out epoch milliseconds if provided."""
+        """Validate punch_out if provided."""
         if v is not None:
             return validate_epoch_ms(v)
         return v
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Endpoints
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # GET /health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    """Health check endpoint.
-
-    Pings MongoDB and returns {"status": "ok"} on success.
-    Returns 503 if MongoDB is unreachable.
-    On first successful ping, lazily creates indexes if not already done.
-    """
+    """Ping MongoDB, lazily create indexes on first success. 503 if unreachable."""
     try:
         client.admin.command("ping")
         _ensure_indexes()
@@ -860,11 +589,7 @@ async def health_check():
 # ---------------------------------------------------------------------------
 @app.post("/employees", status_code=201)
 async def create_employee(body: EmployeeCreate):
-    """Create a new employee.
-
-    Returns 201 on success.
-    Returns 409 if an employee with the same emp_code already exists.
-    """
+    """Create an employee. 409 if emp_code already exists."""
     now = datetime.now(UTC)
     doc = {
         "emp_code": body.emp_code,
@@ -895,11 +620,7 @@ async def list_employees(
     page: int = Query(1, ge=1, description="Page number (1-based)"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
 ):
-    """List employees with optional department filter and pagination.
-
-    Results are sorted by emp_code (ascending). Pagination is done
-    server-side using MongoDB skip/limit.
-    """
+    """Paginated employee list, sorted by emp_code, optional dept filter."""
     filter_q: dict = {}
     if department:
         filter_q["department"] = department
@@ -928,16 +649,7 @@ async def list_employees(
 # ---------------------------------------------------------------------------
 @app.post("/attendance/punch-in", status_code=201)
 async def punch_in(body: PunchInRequest):
-    """Record a punch-in for an employee.
-
-    - Verifies the employee exists (404 if not)
-    - Determines punch_in_utc from body.punched_at or current time
-    - Derives attendance date using get_ist_date (handles overnight shifts)
-    - Computes late_minutes with date_str (F1 fix)
-    - Inserts record, catches DuplicateKeyError → 409 (already punched in today)
-
-    Returns 201 on success.
-    """
+    """Punch in. 404 if unknown emp, 409 if already punched in today."""
     # Verify employee exists
     emp = employees_col.find_one({"emp_code": body.emp_code})
     if not emp:
@@ -993,18 +705,7 @@ async def punch_in(body: PunchInRequest):
 # ---------------------------------------------------------------------------
 @app.post("/attendance/punch-out")
 async def punch_out(body: PunchOutRequest):
-    """Record a punch-out for an employee.
-
-    - Verifies the employee exists (404)
-    - Determines punch_out_utc from body.punched_at or current time
-    - Finds the most recent record with punch_in <= punched_at and present status (F4)
-    - If no candidate: 404 if no records at all, 422 if punch_out before all punch_ins
-    - Validates punch_out > punch_in (422)
-    - Validates within 24 hours (422)
-    - Checks already punched out (409)
-    - Computes work_hours, overtime_minutes, half_day
-    - Atomic update via find_one_and_update (F4)
-    """
+    """Punch out. Validates 24h limit, computes derived fields, atomic update (F4)."""
     # Verify employee
     emp = employees_col.find_one({"emp_code": body.emp_code})
     if not emp:
@@ -1124,12 +825,7 @@ async def list_attendance(
     page: int = Query(1, ge=1, description="Page number (1-based)"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
 ):
-    """List attendance records with optional filters and pagination.
-
-    Filters: emp_code, date, status, department (via employee lookup).
-    Sorted by (date DESC, emp_code ASC). Server-side pagination.
-    No _id or id fields are leaked in the response.
-    """
+    """Paginated attendance list, sorted by (date DESC, emp_code ASC)."""
     filter_q: dict = {}
     if emp_code:
         filter_q["emp_code"] = emp_code
@@ -1182,19 +878,7 @@ async def regularize_attendance(
     date: str = Path(..., description="Attendance date (YYYY-MM-DD)"),
     body: RegularizeRequest = ...,
 ):
-    """Regularize an attendance record.
-
-    Applies partial changes with validation:
-    - ABSENT/LEAVE status clears punch_in and punch_out
-    - Present-type status requires punch_in
-    - punch_out must be > punch_in and within 24 hours
-    - punch_in must stay on the attendance date
-    - Derived fields (late_minutes, overtime_minutes, work_hours, half_day)
-      are recomputed from the final state
-    - Only actual changes are recorded (422 if none)
-    - Optimistic concurrency via history length check (F8)
-    - Returns 409 if concurrent modification detected
-    """
+    """Partial-update attendance. Recomputes derived fields, optimistic concurrency (F8)."""
     # Validate date format
     _validate_date_str(date, "date")
 
@@ -1383,18 +1067,7 @@ async def employee_monthly(
     emp_code: str = Path(..., description="Employee code"),
     month: str = Query(..., description="Month in YYYY-MM format"),
 ):
-    """Monthly analytics for a single employee.
-
-    Computes:
-    - working_days: Number of Mon-Fri in the month (since join date) per R7
-    - present_days: Count of present days with half-day support (0.5 for half days),
-      only counting weekday (Mon-Fri) attendance
-    - leave_days: Count of LEAVE status days
-    - late_count: Days with late_minutes > 0
-    - total_late_minutes: Sum of all late minutes
-    - total_overtime_minutes: Sum of all overtime minutes
-    - attendance_pct: F3 — round_half_up_2(present_days / working_days * 100)
-    """
+    """Monthly stats: working/present/leave days, late count, attendance % (F3)."""
     # Validate month
     year, mon = _validate_month_str(month)
 
@@ -1549,16 +1222,7 @@ async def employee_monthly(
 async def department_summary(
     month: str = Query(..., description="Month in YYYY-MM format"),
 ):
-    """Department summary analytics for a given month.
-
-    Pipeline:
-    1. Match employees with joined_on <= month_end
-    2. Group by department with emp_codes + headcount
-    3. $lookup into attendance_logs (pipeline-style) for the month
-    4. Project and sort by department
-
-    avg_work_hours is computed with round_half_up_2.
-    """
+    """Department summary: headcount, present days, avg work hours, late count."""
     # Validate month
     year, mon = _validate_month_str(month)
 
@@ -1690,18 +1354,7 @@ async def late_leaderboard(
     month: str = Query(..., description="Month in YYYY-MM format"),
     limit: int = Query(10, ge=1, le=50, description="Max number of employees to return"),
 ):
-    """Late-arrival leaderboard for a given month.
-
-    F5: Pipeline:
-    1. $match attendance with late_minutes > 0 in the month
-    2. $group by emp_code → total_late_minutes, late_days
-    3. $lookup employees collection
-    4. $unwind — this drops orphans (attendance records without matching employee)
-    5. $setWindowFields with $rank (by total_late_minutes DESC)
-    6. $match rank <= limit
-    7. $project final fields
-    8. $sort by total_late_minutes DESC
-    """
+    """Late-arrival leaderboard with competition ranking ($rank), orphan drop (F5)."""
     # Validate month
     year, mon = _validate_month_str(month)
 
@@ -1786,26 +1439,7 @@ async def department_trend(
     from_date: str = Query(..., alias="from", description="Start date YYYY-MM-DD"),
     to_date: str = Query(..., alias="to", description="End date YYYY-MM-DD"),
 ):
-    """Department attendance trend with 7-day moving average.
-
-    F6 constraints:
-    - Date range must not exceed 92 days inclusive
-    - attendance_rate uses integer arithmetic:
-      rate = floor((20000 * 2*present_count + 2*headcount) / (2 * 2*headcount)) / 10000
-      Only computed when is_working_day AND headcount > 0, else null
-    - 7-day moving average uses integer arithmetic:
-      _rate_sum = sum of (attendance_rate * 10000) over window [-6, 0]
-      _rate_count = count of non-null attendance_rate over window [-6, 0]
-      moving_avg_7d = floor((2 * _rate_sum * 10000 + _rate_count) / (2 * _rate_count)) / 10000
-
-    Pipeline stages:
-    1. $match → 2. $addFields (dateObj) → 3. $group by dateObj →
-    4. $densify → 5. $set defaults → 6. $set is_working_day/headcount →
-    7. $set attendance_rate (integer arithmetic) →
-    8. $setWindowFields (_rate_sum, _rate_count) →
-    9. $set moving_avg_7d → 10. $unset temp →
-    11. $sort → 12. $project
-    """
+    """7-day MA trend with $densify for gap-fill, integer-arith rounding (F6)."""
     # Validate from/to dates
     from_d = _validate_date_str(from_date, "from_date")
     to_d = _validate_date_str(to_date, "to_date")
@@ -2154,20 +1788,7 @@ async def explain_query(
         description=f"Endpoint name. One of: {', '.join(VALID_EXPLAIN_ENDPOINTS.keys())}",
     ),
 ):
-    """Return the MongoDB explain plan for a given analytics endpoint.
-
-    F7: Uses db.command("explain", ..., verbosity="executionStats")
-    and converts the result using json.loads(json_util.dumps(explain_doc))
-    to handle BSON types (ObjectId, datetime, etc.) that are not
-    directly JSON-serializable.
-
-    Valid endpoint names:
-    - attendance_list
-    - employee_monthly
-    - department_summary
-    - late_leaderboard
-    - department_trend
-    """
+    """Return MongoDB explain plan for an analytics endpoint (F7)."""
     if endpoint not in VALID_EXPLAIN_ENDPOINTS:
         raise HTTPException(
             status_code=422,
